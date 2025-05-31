@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QR Code Pattern Finder</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <h1>QR Code Pattern Finder</h1>
+    <p>Searching for pattern: <strong><%= patternFile %></strong></p>
+
+    <div class="controls">
+        <button id="startButton">Start Searching</button>
+        <button id="stopButton" disabled>Stop Searching</button>
+    </div>
+
+    <div class="status">
+        <p>Status: <span id="searchState">Idle</span></p>
+        <p>QR Codes Scanned: <span id="scannedCount"><%= initialSearchStatus.searchedCount %></span></p>
+        <p>Matches Found: <span id="matchesFoundCount"><%= initialSearchStatus.foundCount %></span></p>
+    </div>
+
+    <h2>Found Matches:</h2>
+    <div id="matchesContainer" class="matches-grid">
+        <% initialMatches.forEach(function(match) { %>
+            <div class="match-item" id="match-<%= match.id %>">
+                <img src="<%= match.qrImageUrl %>" alt="QR for <%= match.url %>">
+                <p class="match-url" title="<%= match.url %>"><%= match.url %></p>
+                <p class="match-info">Pattern: <%= match.pattern %> @ (<%= match.location.x %>, <%= match.location.y %>)</p>
+                <p class="match-time"><%= match.timestamp %></p>
+            </div>
+        <% }); %>
+        <% if (initialMatches.length === 0) { %>
+            <p id="noMatchesMessage">No matches found yet.</p>
+        <% } %>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/client.js"></script>
+</body>
+</html>
