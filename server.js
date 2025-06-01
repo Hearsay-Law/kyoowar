@@ -3,22 +3,22 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const path = require("path");
-const fs = require("fs").promises;
+const fs = require("fs").promises; // Keep using fs.promises
 const os = require("os");
 const { Worker } = require("worker_threads");
-const Jimp = require("jimp"); // For main thread's test block & PURE_COLOR constants
+const Jimp = require("jimp");
+const inquirer = require("inquirer");
 
 const config = require("./config");
 const QRCodeService = require("./services/QRCodeService");
 const PatternMatcherService = require("./services/PatternMatcherService");
 
 // --- Configuration & Constants ---
-const RUN_MATCHER_TEST_ONCE = true; // Master switch for the self-test
+const RUN_MATCHER_TEST_ONCE = true;
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const TEMPLATES_DIR = path.join(__dirname, "templates");
-const STATUS_UPDATE_INTERVAL_MS = 250; // For throttling UI updates
+const STATUS_UPDATE_INTERVAL_MS = 250;
 
-// Jimp constants for self-test image generation
 const PURE_BLACK_INT = Jimp.rgbaToInt(0, 0, 0, 255);
 const PURE_WHITE_INT = Jimp.rgbaToInt(255, 255, 255, 255);
 
@@ -30,18 +30,20 @@ const io = new Server(server);
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
 app.use(express.static(path.join(__dirname, "public")));
-app.use("/uploads", express.static(UPLOADS_DIR)); // Serve generated QR codes
+app.use("/uploads", express.static(UPLOADS_DIR));
 
 // --- Service Initialization ---
 const qrCodeService = new QRCodeService(UPLOADS_DIR);
-const mainThreadPatternMatcher = new PatternMatcherService(TEMPLATES_DIR);
+const mainThreadPatternMatcher = new PatternMatcherService(TEMPLATES_DIR); // TEMPLATES_DIR is still needed for base path
 
 // --- Global State ---
+let selectedPatternFile = null; // <--- NEW: To store the user-selected pattern file
+
 // Search State
 let isSearching = false;
 let searchedCount = 0;
 let foundMatches = [];
-let testRunCompleted = !RUN_MATCHER_TEST_ONCE; // Initialized based on whether test should run
+let testRunCompleted = !RUN_MATCHER_TEST_ONCE;
 let statusUpdateInterval = null;
 
 // Worker Pool State
@@ -79,14 +81,14 @@ function handleWorkerMessage(message, worker) {
     if (message.match) {
       handleMatchFound(message.url, message.match);
     }
-    assignTaskToWorker(worker); // Assign new task or add to idle
+    assignTaskToWorker(worker);
   } else if (message.type === "ready") {
     console.log(
       `Worker ${worker.threadId} (PID: ${worker.pid || "N/A"}) reported ready.`
     );
     workersSuccessfullyInitialized++;
     idleWorkers.push(worker);
-    assignTaskToWorker(worker); // Attempt to assign task immediately
+    assignTaskToWorker(worker);
     if (workersSuccessfullyInitialized === desiredWorkers && isSearching) {
       console.log("All desired workers initialized and ready for tasks.");
     }
@@ -115,29 +117,30 @@ function handleWorkerExit(code, worker) {
       worker.pid || "N/A"
     }) exited with code ${code}.`
   );
-
-  // Remove from active pools
   const poolIndex = workerPool.indexOf(worker);
   if (poolIndex > -1) workerPool.splice(poolIndex, 1);
   const idleIndex = idleWorkers.indexOf(worker);
   if (idleIndex > -1) idleWorkers.splice(idleIndex, 1);
-
-  // If search is active and worker exited unexpectedly, try to replace it
   if (isSearching && code !== 0) {
     console.log("Attempting to replace unexpectedly exited worker.");
-    createAndAddWorker();
+    createAndAddWorker(); // Will now use the globally selectedPatternFile
   }
 }
 
 // --- Worker Management ---
 function createAndAddWorker() {
   if (workerPool.length >= desiredWorkers) return null;
+  if (!selectedPatternFile) {
+    // <--- NEW: Guard against no pattern selected
+    console.error("Cannot create worker: No pattern file has been selected.");
+    return null;
+  }
 
   const worker = new Worker(path.join(__dirname, "qr_worker.js"), {
     workerData: {
       uploadsDir: UPLOADS_DIR,
       templatesDir: TEMPLATES_DIR,
-      patternFile: config.patternFile,
+      patternFile: selectedPatternFile, // <--- MODIFIED: Use selected pattern
       qrSearchOptions: config.qrSearchOptions,
     },
   });
@@ -151,16 +154,14 @@ function createAndAddWorker() {
 }
 
 function assignTaskToWorker(worker) {
-  if (!worker || typeof worker.postMessage !== "function") return; // Worker might have been terminated
+  if (!worker || typeof worker.postMessage !== "function") return;
 
   if (taskQueue.length > 0 && isSearching) {
     const task = taskQueue.shift();
     worker.postMessage(task);
-    // Worker is now busy, remove from idle if it was there
     const idleIndex = idleWorkers.indexOf(worker);
     if (idleIndex > -1) idleWorkers.splice(idleIndex, 1);
   } else {
-    // No tasks or not searching, ensure worker is in idle list if valid and not already there
     if (!idleWorkers.includes(worker) && workerPool.includes(worker)) {
       idleWorkers.push(worker);
     }
@@ -168,10 +169,8 @@ function assignTaskToWorker(worker) {
 }
 
 function terminateAndReplaceWorker(workerToReplace) {
-  // Remove from pools immediately to prevent re-assignment
   const poolIndex = workerPool.indexOf(workerToReplace);
   if (poolIndex > -1) workerPool.splice(poolIndex, 1);
-
   const idleIndex = idleWorkers.indexOf(workerToReplace);
   if (idleIndex > -1) idleWorkers.splice(idleIndex, 1);
 
@@ -184,7 +183,6 @@ function terminateAndReplaceWorker(workerToReplace) {
         err
       )
     );
-  // The 'exit' handler will manage replacement if necessary.
 }
 
 // --- Search Logic & Scheduling ---
@@ -192,54 +190,59 @@ async function handleMatchFound(url, matchLocation, isTest = false) {
   const displayQr = await qrCodeService.generateQRCodeToFile(
     url,
     config.qrDisplayOptions,
-    isTest ? "testmatch" : "match" // Filename prefix for test matches
+    isTest ? "testmatch" : "match"
   );
 
   if (displayQr) {
     const matchData = {
       id: `match_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       url: url,
-      qrImageUrl: displayQr.urlPath, // URL path for client to access image
-      pattern: matchLocation.pattern,
+      qrImageUrl: displayQr.urlPath,
+      pattern: matchLocation.pattern, // This comes from the worker, which gets the pattern name
       location: { x: matchLocation.x, y: matchLocation.y },
       timestamp: new Date().toLocaleTimeString(),
       isTestMatch: isTest,
     };
-    foundMatches.unshift(matchData); // Add to beginning for newest first
+    foundMatches.unshift(matchData);
     io.emit("patternFound", matchData);
     console.log(
       `${isTest ? "[SELF-TEST] " : ""}MATCH FOUND: URL: ${url}, Pattern: ${
-        matchData.pattern
+        matchData.pattern // This should reflect the selectedPatternFile base name
       } at (${matchData.location.x},${matchData.location.y})`
     );
   }
 }
 
 async function runMainThreadSelfTest() {
+  if (!selectedPatternFile) {
+    // <--- NEW: Check if pattern is selected
+    console.error("[SELF-TEST] No pattern file selected. Skipping self-test.");
+    testRunCompleted = true;
+    return;
+  }
   if (
     !mainThreadPatternMatcher.patternMatrix ||
     !mainThreadPatternMatcher.patternImage
   ) {
     console.error(
-      "[SELF-TEST] Pattern not properly loaded in mainThreadPatternMatcher. Skipping self-test."
+      `[SELF-TEST] Pattern '${selectedPatternFile}' not properly loaded in mainThreadPatternMatcher. Skipping self-test.`
     );
-    testRunCompleted = true; // Mark as completed to prevent retries
+    testRunCompleted = true;
     return;
   }
 
   console.log(
     `[SELF-TEST - Scan ${searchedCount + 1}] Simulating QR with pattern: ${
-      mainThreadPatternMatcher.patternFileName
+      mainThreadPatternMatcher.patternFileName // This should be the selectedPatternFile
     }`
   );
   const testUrl = "self_test_mock_pattern_main_thread";
 
-  // Create a mock QR image with the pattern embedded
   const mockQrWidth = mainThreadPatternMatcher.patternWidth + 5;
   const mockQrHeight = mainThreadPatternMatcher.patternHeight + 5;
   const qrJimpImage = new Jimp(mockQrWidth, mockQrHeight, PURE_WHITE_INT);
   const testPatternX = 2,
-    testPatternY = 2; // Arbitrary placement
+    testPatternY = 2;
 
   qrJimpImage.blit(
     mainThreadPatternMatcher.patternImage,
@@ -274,10 +277,8 @@ async function runMainThreadSelfTest() {
 async function mainSearchScheduler() {
   if (!isSearching) return;
 
-  // Run self-test once if enabled and not yet completed
   if (RUN_MATCHER_TEST_ONCE && !testRunCompleted) {
     await runMainThreadSelfTest();
-    // Emit status after self-test as it modifies searchedCount
     io.emit("searchStatus", {
       searchedCount,
       isSearching,
@@ -285,17 +286,15 @@ async function mainSearchScheduler() {
     });
   }
 
-  // Fill task queue up to a certain capacity
-  const maxQueueSize = desiredWorkers * 3; // Heuristic: keep queue reasonably full
+  const maxQueueSize = desiredWorkers * 3;
   while (isSearching && taskQueue.length < maxQueueSize) {
     taskQueue.push({ type: "processURL", url: generateRandomUrl() });
   }
 
-  // Assign tasks from queue to idle workers
   while (idleWorkers.length > 0 && taskQueue.length > 0 && isSearching) {
-    const worker = idleWorkers.shift(); // Take from front
-    const task = taskQueue.shift(); // Take from front
-    if (worker) worker.postMessage(task); // Worker might have been terminated
+    const worker = idleWorkers.shift();
+    const task = taskQueue.shift();
+    if (worker) worker.postMessage(task);
   }
 
   if (isSearching) {
@@ -306,13 +305,37 @@ async function mainSearchScheduler() {
 // --- HTTP Route Handlers ---
 app.get("/", async (req, res) => {
   try {
+    if (!selectedPatternFile) {
+      // <--- NEW: Check if pattern selected
+      res
+        .status(500)
+        .send(
+          "Server error: No pattern file has been selected at startup. Please restart the server."
+        );
+      return;
+    }
     // Ensure pattern info is available for the template (e.g., pattern filename)
-    // Main `main()` function attempts initial load; this is a fallback.
+    // Main `main()` function now loads the selected pattern. This check ensures it's loaded.
     if (!mainThreadPatternMatcher.patternMatrix) {
       console.log(
-        "[Route /] Main thread pattern not yet loaded for display, attempting now..."
+        `[Route /] Main thread pattern '${selectedPatternFile}' not yet loaded for display, attempting now...`
       );
-      await mainThreadPatternMatcher.loadPattern(config.patternFile);
+      // Attempt to load it again if it wasn't. This is a fallback.
+      // The main() function should have already loaded it.
+      const loaded = await mainThreadPatternMatcher.loadPattern(
+        selectedPatternFile
+      );
+      if (!loaded) {
+        console.error(
+          `[Route /] Failed to load pattern '${selectedPatternFile}' on demand.`
+        );
+        res
+          .status(500)
+          .send(
+            `Server error: Could not load selected pattern file '${selectedPatternFile}'.`
+          );
+        return;
+      }
     }
 
     res.render("index", {
@@ -323,7 +346,7 @@ app.get("/", async (req, res) => {
       },
       initialMatches: foundMatches,
       patternFile:
-        mainThreadPatternMatcher.patternFileName || config.patternFile,
+        mainThreadPatternMatcher.patternFileName || selectedPatternFile, // <--- MODIFIED
     });
   } catch (routeError) {
     console.error("[Route /] Error in root route handler:", routeError);
@@ -333,15 +356,23 @@ app.get("/", async (req, res) => {
 
 // --- Socket.IO Event Handlers ---
 async function ensureMainPatternLoadedForTest(socket) {
+  if (!selectedPatternFile) {
+    // <--- NEW: Check if pattern selected
+    const errorMsg =
+      "Cannot start search: No pattern file was selected at server startup.";
+    console.error(errorMsg);
+    socket.emit("searchError", errorMsg);
+    return false;
+  }
   if (!mainThreadPatternMatcher.patternMatrix) {
     console.log(
-      "[Socket StartSearch] Main thread pattern not loaded, attempting for self-test..."
+      `[Socket StartSearch] Main thread pattern '${selectedPatternFile}' not loaded, attempting for self-test...`
     );
     const mainPatternLoaded = await mainThreadPatternMatcher.loadPattern(
-      config.patternFile
+      selectedPatternFile // <--- MODIFIED
     );
     if (!mainPatternLoaded) {
-      const errorMsg = `Main thread failed to load pattern '${config.patternFile}' for self-test. Cannot start search.`;
+      const errorMsg = `Main thread failed to load pattern '${selectedPatternFile}' for self-test. Cannot start search.`;
       console.error(errorMsg);
       socket.emit("searchError", errorMsg);
       return false;
@@ -352,12 +383,9 @@ async function ensureMainPatternLoadedForTest(socket) {
 
 function initializeSearchStateForStart() {
   isSearching = true;
-  testRunCompleted = !RUN_MATCHER_TEST_ONCE; // Reset test completion flag
+  testRunCompleted = !RUN_MATCHER_TEST_ONCE;
   searchedCount = 0;
-  // foundMatches are intentionally not cleared to persist across search sessions
   workersSuccessfullyInitialized = 0;
-
-  // Clear queues and worker lists
   idleWorkers.length = 0;
   taskQueue.length = 0;
 }
@@ -367,17 +395,20 @@ async function resetAndInitializeWorkerPool() {
   while (workerPool.length > 0) {
     const oldWorker = workerPool.pop();
     if (oldWorker) {
-      // Check if worker exists (could be null if pool was modified)
       await oldWorker
         .terminate()
         .catch((e) => console.error(`Error terminating old worker: ${e}`));
     }
   }
-  // workerPool is now empty
 
   console.log(`Creating up to ${desiredWorkers} new workers.`);
+  if (!selectedPatternFile) {
+    // <--- NEW: Check before creating workers
+    console.error("Cannot initialize worker pool: No pattern selected.");
+    return; // Prevent worker creation if no pattern
+  }
   for (let i = 0; i < desiredWorkers; i++) {
-    createAndAddWorker();
+    createAndAddWorker(); // Will use the globally selectedPatternFile
   }
 }
 
@@ -385,7 +416,6 @@ function startStatusUpdater() {
   if (statusUpdateInterval) clearInterval(statusUpdateInterval);
   statusUpdateInterval = setInterval(() => {
     if (isSearching) {
-      // Only emit if actively searching
       io.emit("searchStatus", {
         searchedCount,
         isSearching,
@@ -404,14 +434,11 @@ function stopStatusUpdater() {
 
 function shutdownActiveWorkers() {
   console.log("Signaling workers to shut down...");
-  // Iterate over a copy of workerPool as workers might be removed during iteration by their exit handlers
   [...workerPool].forEach((worker) => {
     if (worker && typeof worker.postMessage === "function") {
       worker.postMessage({ type: "shutdown" });
     }
   });
-  // Workers will be removed from workerPool and idleWorkers by their 'exit' handlers.
-  // Explicitly clearing idleWorkers here is also fine as a safeguard.
   idleWorkers.length = 0;
 }
 
@@ -421,7 +448,8 @@ io.on("connection", (socket) => {
     isSearching,
     searchedCount,
     foundMatches,
-    patternFile: mainThreadPatternMatcher.patternFileName || config.patternFile,
+    patternFile:
+      mainThreadPatternMatcher.patternFileName || selectedPatternFile, // <--- MODIFIED
   });
 
   socket.on("startSearch", async () => {
@@ -430,23 +458,31 @@ io.on("connection", (socket) => {
       socket.emit("searchError", "Search is already in progress.");
       return;
     }
+    if (!selectedPatternFile) {
+      // <--- NEW: Critical check
+      socket.emit(
+        "searchError",
+        "Cannot start search: No pattern file was selected at server startup."
+      );
+      return;
+    }
     if (
       RUN_MATCHER_TEST_ONCE &&
       !(await ensureMainPatternLoadedForTest(socket))
     ) {
-      return; // Error already emitted by ensureMainPatternLoadedForTest
+      return;
     }
 
     initializeSearchStateForStart();
-    await resetAndInitializeWorkerPool(); // Terminates old, creates new
+    await resetAndInitializeWorkerPool();
 
     io.emit("searchStatus", {
       searchedCount,
       isSearching,
       foundCount: foundMatches.length,
-    }); // Initial status
-    mainSearchScheduler(); // Start the search loop
-    startStatusUpdater(); // Start periodic status updates
+    });
+    mainSearchScheduler();
+    startStatusUpdater();
   });
 
   socket.on("stopSearch", () => {
@@ -454,20 +490,16 @@ io.on("connection", (socket) => {
       console.log("Search stop request ignored, not currently running.");
       return;
     }
-
-    isSearching = false; // Primary flag to stop schedulers and worker task assignments
+    isSearching = false;
     console.log(
       "Search stopping... Clearing task queue and signaling workers."
     );
-
-    taskQueue.length = 0; // Clear pending tasks
-    shutdownActiveWorkers(); // Ask workers to shut down gracefully
+    taskQueue.length = 0;
+    shutdownActiveWorkers();
     stopStatusUpdater();
-
-    // Emit final status
     io.emit("searchStatus", {
       searchedCount,
-      isSearching, // Will be false
+      isSearching,
       foundCount: foundMatches.length,
     });
   });
@@ -478,14 +510,65 @@ io.on("connection", (socket) => {
 });
 
 // --- Application Startup ---
-async function main() {
+async function selectPatternFile() {
   try {
-    // Clean and ensure uploads directory exists
+    const files = await fs.readdir(TEMPLATES_DIR);
+    const imageFiles = files.filter((file) =>
+      /\.(png|jpe?g|gif|bmp)$/i.test(file)
+    );
+
+    if (imageFiles.length === 0) {
+      console.error(
+        `No image files found in the templates directory: ${TEMPLATES_DIR}`
+      );
+      console.error(
+        "Please add at least one pattern image (e.g., .png, .jpg) to the templates folder."
+      );
+      return null;
+    }
+
+    // Determine the correct way to call prompt
+    const promptFn =
+      inquirer.prompt || (inquirer.default && inquirer.default.prompt);
+
+    if (typeof promptFn !== "function") {
+      console.error(
+        "Failed to find the inquirer.prompt function. Please check your inquirer version and import statement."
+      );
+      throw new TypeError("inquirer.prompt is not a function or accessible");
+    }
+
+    const answers = await promptFn([
+      // <--- Use promptFn
+      {
+        type: "list",
+        name: "pattern",
+        message: "Select a pattern file to search for:",
+        choices: imageFiles,
+      },
+    ]);
+    return answers.pattern;
+  } catch (err) {
+    console.error("Error during pattern selection:", err);
+    return null;
+  }
+}
+
+async function main() {
+  // --- NEW: Select pattern file at startup ---
+  selectedPatternFile = await selectPatternFile();
+  if (!selectedPatternFile) {
+    console.error("No pattern file selected or an error occurred. Exiting.");
+    process.exit(1); // Exit if no pattern is chosen
+  }
+  console.log(`Using pattern file: ${selectedPatternFile}`);
+  // --- End NEW ---
+
+  try {
     await fs.rm(UPLOADS_DIR, { recursive: true, force: true });
     console.log("Cleaned uploads directory.");
   } catch (e) {
     if (e.code !== "ENOENT") {
-      // Ignore error if directory doesn't exist
       console.error("Could not clean uploads directory:", e);
     }
   }
@@ -493,23 +576,25 @@ async function main() {
 
   // Load pattern for main thread (used for self-test and displaying pattern info)
   const initialPatternLoaded = await mainThreadPatternMatcher.loadPattern(
-    config.patternFile
+    selectedPatternFile // <--- MODIFIED: Use selected pattern
   );
   if (initialPatternLoaded) {
     console.log(
-      `[Startup] Initial pattern '${config.patternFile}' loaded for self-test/info.`
+      `[Startup] Initial pattern '${selectedPatternFile}' loaded for self-test/info.`
     );
   } else {
-    console.warn(
-      `[Startup] Initial pattern '${config.patternFile}' could not be loaded. Self-test might fail or be skipped.`
+    // This is more critical now if the selected file fails to load
+    console.error(
+      `[Startup] CRITICAL: Selected pattern '${selectedPatternFile}' could not be loaded. Exiting.`
     );
+    process.exit(1); // Exit if the chosen pattern can't be loaded
   }
 
   server.listen(config.port, () => {
     console.log(`QR Pattern Finder running at http://localhost:${config.port}`);
     if (RUN_MATCHER_TEST_ONCE) {
       console.log(
-        "Matcher self-test (RUN_MATCHER_TEST_ONCE) is ENABLED for the first search after 'Start Searching'."
+        `Matcher self-test (RUN_MATCHER_TEST_ONCE) is ENABLED for the first search after 'Start Searching' using pattern '${selectedPatternFile}'.`
       );
     }
   });
@@ -517,5 +602,5 @@ async function main() {
 
 main().catch((err) => {
   console.error("Critical startup error:", err);
-  process.exit(1); // Exit if main setup fails
+  process.exit(1);
 });

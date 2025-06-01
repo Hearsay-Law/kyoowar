@@ -17,7 +17,8 @@ module.exports = {
   },
 
   // --- Pattern Matching ---
-  patternFile: "C_4x7.png", // Filename of the pattern to search for (relative to TEMPLATES_DIR).
+  // patternFile will now be selected by the user at startup.
+  // No hardcoded value here anymore.
 
   // --- URL Generation for QR Content ---
   urlTemplate: "http://www.{RANDOM_STRING}.com", // Base template for URLs embedded in QRs.
