@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QR Code Game of Life</title>
+    <link rel="stylesheet" href="/css/style.css" />
+    <!-- You might want a new CSS or reuse -->
+    <style>
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        font-family: sans-serif;
+      }
+      #lifeCanvas {
+        border: 1px solid black;
+        margin-top: 20px;
+      }
+      .controls {
+        margin-top: 10px;
+        margin-bottom: 20px;
+      }
+      .controls button,
+      .controls input,
+      .controls label {
+        margin: 0 5px;
+        padding: 5px 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>QR Code Conway's Game of Life</h1>
+
+    <div class="controls">
+      <button id="generateQRBoard">Generate New QR Life Board</button>
+      <label for="urlInput">URL for QR (optional):</label>
+      <input type="text" id="urlInput" placeholder="Leave blank for random" />
+    </div>
+    <div class="controls">
+      <button id="playPauseButton">Play</button>
+      <button id="nextStepButton">Next Step</button>
+      <label for="speedRange">Speed (ms per step):</label>
+      <input type="range" id="speedRange" min="50" max="1000" value="200" />
+      <span id="speedValue">200ms</span>
+    </div>
+
+    <canvas id="lifeCanvas"></canvas>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/life_client.js"></script>
+    <!-- We will create this next -->
+  </body>
+</html>

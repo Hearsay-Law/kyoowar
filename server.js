@@ -3,7 +3,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const path = require("path");
-const fs = require("fs").promises; // Keep using fs.promises
+const fs = require("fs").promises;
 const os = require("os");
 const { Worker } = require("worker_threads");
 const Jimp = require("jimp");
@@ -12,6 +12,10 @@ const inquirer = require("inquirer");
 const config = require("./config");
 const QRCodeService = require("./services/QRCodeService");
 const PatternMatcherService = require("./services/PatternMatcherService");
+// --- NEW GOL IMPORTS ---
+const GameOfLifeService = require("./services/GameOfLifeService");
+const QRToLifeGridConverter = require("./services/QRToLifeGridConverter");
+// --- END NEW GOL IMPORTS ---
 
 // --- Configuration & Constants ---
 const RUN_MATCHER_TEST_ONCE = true;
@@ -34,19 +38,21 @@ app.use("/uploads", express.static(UPLOADS_DIR));
 
 // --- Service Initialization ---
 const qrCodeService = new QRCodeService(UPLOADS_DIR);
-const mainThreadPatternMatcher = new PatternMatcherService(TEMPLATES_DIR); // TEMPLATES_DIR is still needed for base path
+const mainThreadPatternMatcher = new PatternMatcherService(TEMPLATES_DIR);
+// --- NEW GOL SERVICE INSTANCES ---
+const gameOfLifeService = new GameOfLifeService();
+const qrToLifeGridConverter = new QRToLifeGridConverter();
+// --- END NEW GOL SERVICE INSTANCES ---
 
-// --- Global State ---
-let selectedPatternFile = null; // <--- NEW: To store the user-selected pattern file
-
-// Search State
+// --- Global State (Pattern Hunter) ---
+let selectedPatternFile = null;
 let isSearching = false;
 let searchedCount = 0;
 let foundMatches = [];
 let testRunCompleted = !RUN_MATCHER_TEST_ONCE;
 let statusUpdateInterval = null;
 
-// Worker Pool State
+// Worker Pool State (Pattern Hunter)
 const numCPUs = os.cpus().length;
 const desiredWorkers = Math.max(1, numCPUs > 1 ? numCPUs - 1 : 1);
 const workerPool = [];
@@ -74,7 +80,7 @@ function generateRandomUrl() {
   return config.urlTemplate + randomString;
 }
 
-// --- Worker Event Handlers ---
+// --- Worker Event Handlers (Pattern Hunter) ---
 function handleWorkerMessage(message, worker) {
   if (message.type === "result") {
     searchedCount++;
@@ -90,7 +96,9 @@ function handleWorkerMessage(message, worker) {
     idleWorkers.push(worker);
     assignTaskToWorker(worker);
     if (workersSuccessfullyInitialized === desiredWorkers && isSearching) {
-      console.log("All desired workers initialized and ready for tasks.");
+      console.log(
+        "All desired (Pattern Hunter) workers initialized and ready for tasks."
+      );
     }
   } else if (message.type === "error") {
     console.error(
@@ -113,7 +121,7 @@ function handleWorkerError(err, worker) {
 
 function handleWorkerExit(code, worker) {
   console.log(
-    `Worker ${worker.threadId} (PID: ${
+    `Pattern Hunter Worker ${worker.threadId} (PID: ${
       worker.pid || "N/A"
     }) exited with code ${code}.`
   );
@@ -122,25 +130,29 @@ function handleWorkerExit(code, worker) {
   const idleIndex = idleWorkers.indexOf(worker);
   if (idleIndex > -1) idleWorkers.splice(idleIndex, 1);
   if (isSearching && code !== 0) {
-    console.log("Attempting to replace unexpectedly exited worker.");
-    createAndAddWorker(); // Will now use the globally selectedPatternFile
+    console.log(
+      "Attempting to replace unexpectedly exited Pattern Hunter worker."
+    );
+    createAndAddWorker();
   }
 }
 
-// --- Worker Management ---
+// --- Worker Management (Pattern Hunter) ---
 function createAndAddWorker() {
   if (workerPool.length >= desiredWorkers) return null;
   if (!selectedPatternFile) {
-    // <--- NEW: Guard against no pattern selected
-    console.error("Cannot create worker: No pattern file has been selected.");
+    console.error(
+      "Cannot create Pattern Hunter worker: No pattern file has been selected."
+    );
     return null;
   }
 
   const worker = new Worker(path.join(__dirname, "qr_worker.js"), {
+    // This is the pattern hunter worker
     workerData: {
       uploadsDir: UPLOADS_DIR,
       templatesDir: TEMPLATES_DIR,
-      patternFile: selectedPatternFile, // <--- MODIFIED: Use selected pattern
+      patternFile: selectedPatternFile,
       qrSearchOptions: config.qrSearchOptions,
     },
   });
@@ -174,18 +186,20 @@ function terminateAndReplaceWorker(workerToReplace) {
   const idleIndex = idleWorkers.indexOf(workerToReplace);
   if (idleIndex > -1) idleWorkers.splice(idleIndex, 1);
 
-  console.log(`Terminating worker ${workerToReplace.threadId}...`);
+  console.log(
+    `Terminating Pattern Hunter worker ${workerToReplace.threadId}...`
+  );
   workerToReplace
     .terminate()
     .catch((err) =>
       console.error(
-        `Error terminating worker ${workerToReplace.threadId}:`,
+        `Error terminating Pattern Hunter worker ${workerToReplace.threadId}:`,
         err
       )
     );
 }
 
-// --- Search Logic & Scheduling ---
+// --- Search Logic & Scheduling (Pattern Hunter) ---
 async function handleMatchFound(url, matchLocation, isTest = false) {
   const displayQr = await qrCodeService.generateQRCodeToFile(
     url,
@@ -198,16 +212,16 @@ async function handleMatchFound(url, matchLocation, isTest = false) {
       id: `match_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       url: url,
       qrImageUrl: displayQr.urlPath,
-      pattern: matchLocation.pattern, // This comes from the worker, which gets the pattern name
+      pattern: matchLocation.pattern,
       location: { x: matchLocation.x, y: matchLocation.y },
       timestamp: new Date().toLocaleTimeString(),
       isTestMatch: isTest,
     };
     foundMatches.unshift(matchData);
-    io.emit("patternFound", matchData);
+    io.emit("patternFound", matchData); // Emits to global namespace for Pattern Hunter
     console.log(
       `${isTest ? "[SELF-TEST] " : ""}MATCH FOUND: URL: ${url}, Pattern: ${
-        matchData.pattern // This should reflect the selectedPatternFile base name
+        matchData.pattern
       } at (${matchData.location.x},${matchData.location.y})`
     );
   }
@@ -215,7 +229,6 @@ async function handleMatchFound(url, matchLocation, isTest = false) {
 
 async function runMainThreadSelfTest() {
   if (!selectedPatternFile) {
-    // <--- NEW: Check if pattern is selected
     console.error("[SELF-TEST] No pattern file selected. Skipping self-test.");
     testRunCompleted = true;
     return;
@@ -233,7 +246,7 @@ async function runMainThreadSelfTest() {
 
   console.log(
     `[SELF-TEST - Scan ${searchedCount + 1}] Simulating QR with pattern: ${
-      mainThreadPatternMatcher.patternFileName // This should be the selectedPatternFile
+      mainThreadPatternMatcher.patternFileName
     }`
   );
   const testUrl = "self_test_mock_pattern_main_thread";
@@ -280,6 +293,7 @@ async function mainSearchScheduler() {
   if (RUN_MATCHER_TEST_ONCE && !testRunCompleted) {
     await runMainThreadSelfTest();
     io.emit("searchStatus", {
+      // Emits to global namespace for Pattern Hunter
       searchedCount,
       isSearching,
       foundCount: foundMatches.length,
@@ -303,10 +317,10 @@ async function mainSearchScheduler() {
 }
 
 // --- HTTP Route Handlers ---
+// Pattern Hunter App Route
 app.get("/", async (req, res) => {
   try {
     if (!selectedPatternFile) {
-      // <--- NEW: Check if pattern selected
       res
         .status(500)
         .send(
@@ -314,14 +328,10 @@ app.get("/", async (req, res) => {
         );
       return;
     }
-    // Ensure pattern info is available for the template (e.g., pattern filename)
-    // Main `main()` function now loads the selected pattern. This check ensures it's loaded.
     if (!mainThreadPatternMatcher.patternMatrix) {
       console.log(
         `[Route /] Main thread pattern '${selectedPatternFile}' not yet loaded for display, attempting now...`
       );
-      // Attempt to load it again if it wasn't. This is a fallback.
-      // The main() function should have already loaded it.
       const loaded = await mainThreadPatternMatcher.loadPattern(
         selectedPatternFile
       );
@@ -339,6 +349,7 @@ app.get("/", async (req, res) => {
     }
 
     res.render("index", {
+      // Renders Pattern Hunter UI
       initialSearchStatus: {
         searchedCount,
         isSearching,
@@ -346,7 +357,7 @@ app.get("/", async (req, res) => {
       },
       initialMatches: foundMatches,
       patternFile:
-        mainThreadPatternMatcher.patternFileName || selectedPatternFile, // <--- MODIFIED
+        mainThreadPatternMatcher.patternFileName || selectedPatternFile,
     });
   } catch (routeError) {
     console.error("[Route /] Error in root route handler:", routeError);
@@ -354,112 +365,44 @@ app.get("/", async (req, res) => {
   }
 });
 
+// --- NEW: Game of Life App Route ---
+app.get("/life", (req, res) => {
+  try {
+    // Pass any necessary initial data to the GOL template if needed
+    // For now, just render it. Client-side JS will request the board.
+    res.render("life", {
+      // Example: pass GOL config if you add it
+      // gameOfLifeConfig: config.gameOfLife || {}
+    });
+  } catch (error) {
+    console.error("[Route /life] Error rendering Game of Life page:", error);
+    res.status(500).send("Server error loading Game of Life page.");
+  }
+});
+// --- END NEW GOL ROUTE ---
+
 // --- Socket.IO Event Handlers ---
-async function ensureMainPatternLoadedForTest(socket) {
-  if (!selectedPatternFile) {
-    // <--- NEW: Check if pattern selected
-    const errorMsg =
-      "Cannot start search: No pattern file was selected at server startup.";
-    console.error(errorMsg);
-    socket.emit("searchError", errorMsg);
-    return false;
-  }
-  if (!mainThreadPatternMatcher.patternMatrix) {
-    console.log(
-      `[Socket StartSearch] Main thread pattern '${selectedPatternFile}' not loaded, attempting for self-test...`
-    );
-    const mainPatternLoaded = await mainThreadPatternMatcher.loadPattern(
-      selectedPatternFile // <--- MODIFIED
-    );
-    if (!mainPatternLoaded) {
-      const errorMsg = `Main thread failed to load pattern '${selectedPatternFile}' for self-test. Cannot start search.`;
-      console.error(errorMsg);
-      socket.emit("searchError", errorMsg);
-      return false;
-    }
-  }
-  return true;
-}
 
-function initializeSearchStateForStart() {
-  isSearching = true;
-  testRunCompleted = !RUN_MATCHER_TEST_ONCE;
-  searchedCount = 0;
-  workersSuccessfullyInitialized = 0;
-  idleWorkers.length = 0;
-  taskQueue.length = 0;
-}
-
-async function resetAndInitializeWorkerPool() {
-  console.log(`Starting search... Terminating any existing workers.`);
-  while (workerPool.length > 0) {
-    const oldWorker = workerPool.pop();
-    if (oldWorker) {
-      await oldWorker
-        .terminate()
-        .catch((e) => console.error(`Error terminating old worker: ${e}`));
-    }
-  }
-
-  console.log(`Creating up to ${desiredWorkers} new workers.`);
-  if (!selectedPatternFile) {
-    // <--- NEW: Check before creating workers
-    console.error("Cannot initialize worker pool: No pattern selected.");
-    return; // Prevent worker creation if no pattern
-  }
-  for (let i = 0; i < desiredWorkers; i++) {
-    createAndAddWorker(); // Will use the globally selectedPatternFile
-  }
-}
-
-function startStatusUpdater() {
-  if (statusUpdateInterval) clearInterval(statusUpdateInterval);
-  statusUpdateInterval = setInterval(() => {
-    if (isSearching) {
-      io.emit("searchStatus", {
-        searchedCount,
-        isSearching,
-        foundCount: foundMatches.length,
-      });
-    }
-  }, STATUS_UPDATE_INTERVAL_MS);
-}
-
-function stopStatusUpdater() {
-  if (statusUpdateInterval) {
-    clearInterval(statusUpdateInterval);
-    statusUpdateInterval = null;
-  }
-}
-
-function shutdownActiveWorkers() {
-  console.log("Signaling workers to shut down...");
-  [...workerPool].forEach((worker) => {
-    if (worker && typeof worker.postMessage === "function") {
-      worker.postMessage({ type: "shutdown" });
-    }
-  });
-  idleWorkers.length = 0;
-}
-
+// Main namespace for Pattern Hunter App
 io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+  console.log("Client connected to main namespace:", socket.id);
   socket.emit("initialData", {
     isSearching,
     searchedCount,
     foundMatches,
     patternFile:
-      mainThreadPatternMatcher.patternFileName || selectedPatternFile, // <--- MODIFIED
+      mainThreadPatternMatcher.patternFileName || selectedPatternFile,
   });
 
   socket.on("startSearch", async () => {
     if (isSearching) {
-      console.log("Search start request ignored, already running.");
+      console.log(
+        "Pattern Hunter: Search start request ignored, already running."
+      );
       socket.emit("searchError", "Search is already in progress.");
       return;
     }
     if (!selectedPatternFile) {
-      // <--- NEW: Critical check
       socket.emit(
         "searchError",
         "Cannot start search: No pattern file was selected at server startup."
@@ -477,6 +420,7 @@ io.on("connection", (socket) => {
     await resetAndInitializeWorkerPool();
 
     io.emit("searchStatus", {
+      // Emits to global namespace
       searchedCount,
       isSearching,
       foundCount: foundMatches.length,
@@ -487,17 +431,20 @@ io.on("connection", (socket) => {
 
   socket.on("stopSearch", () => {
     if (!isSearching) {
-      console.log("Search stop request ignored, not currently running.");
+      console.log(
+        "Pattern Hunter: Search stop request ignored, not currently running."
+      );
       return;
     }
     isSearching = false;
     console.log(
-      "Search stopping... Clearing task queue and signaling workers."
+      "Pattern Hunter: Search stopping... Clearing task queue and signaling workers."
     );
     taskQueue.length = 0;
     shutdownActiveWorkers();
     stopStatusUpdater();
     io.emit("searchStatus", {
+      // Emits to global namespace
       searchedCount,
       isSearching,
       foundCount: foundMatches.length,
@@ -505,9 +452,193 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
+    console.log("Client disconnected from main namespace:", socket.id);
   });
 });
+
+// --- NEW: Game of Life Socket.IO Namespace ---
+const lifeNamespace = io.of("/life");
+
+lifeNamespace.on("connection", (socket) => {
+  console.log("Client connected to /life namespace:", socket.id);
+
+  socket.on("generateLifeFromQR", async (data = {}) => {
+    try {
+      const urlToEncode = data.url || generateRandomUrl(); // Use provided URL or generate random
+      // console.log(`[GOL] Generating QR for URL: ${urlToEncode}`);
+
+      // Generate QR to Jimp. Use less strict QR options for GOL, e.g., allow smaller scale
+      // to get more "pixels" for GOL from typical QR.
+      // Or, use the same as pattern hunter for consistency if desired.
+      const qrOptionsForLife = {
+        // scale: 1, // To get a 1-to-1 mapping of QR module to GOL cell
+        // margin: 0, // To avoid large dead borders in GOL
+        // errorCorrectionLevel: 'L' // Lower EC means simpler QR, maybe better for GOL
+        ...config.qrSearchOptions, // Or reuse existing search options
+        // Override scale and margin for finer GOL grid from QR pixels
+        scale: data.qrScale || 2, // e.g., 2 pixels per QR module
+        margin: data.qrMargin || 1, // Small margin
+      };
+
+      const qrJimpImage = await qrCodeService.generateQRCodeToJimp(
+        urlToEncode,
+        qrOptionsForLife
+      );
+
+      if (!qrJimpImage) {
+        socket.emit("lifeBoardError", {
+          message: "Failed to generate QR code image.",
+        });
+        return;
+      }
+
+      // Convert Jimp image to GOL grid
+      // Use the default 'convert' which uses brightness thresholding.
+      const initialGrid = qrToLifeGridConverter.convert(qrJimpImage);
+      // Or: const initialGrid = qrToLifeGridConverter.convertMonochrome(qrJimpImage);
+
+      if (!initialGrid) {
+        socket.emit("lifeBoardError", {
+          message: "Failed to convert QR to Life grid.",
+        });
+        return;
+      }
+      // console.log(`[GOL] Initial grid generated with ${initialGrid.length} rows, ${initialGrid[0]?.length || 0} cols.`);
+      socket.emit("initialLifeBoard", {
+        grid: initialGrid,
+        sourceUrl: urlToEncode,
+      });
+    } catch (error) {
+      console.error("[GOL] Error in generateLifeFromQR:", error);
+      socket.emit("lifeBoardError", {
+        message: "Server error generating Game of Life board.",
+      });
+    }
+  });
+
+  socket.on("getNextLifeGeneration", (currentGrid) => {
+    if (!currentGrid) {
+      socket.emit("lifeBoardError", {
+        message: "No current grid provided for next generation.",
+      });
+      return;
+    }
+    try {
+      const nextGrid = gameOfLifeService.calculateNextGeneration(currentGrid);
+      socket.emit("newLifeGeneration", { grid: nextGrid });
+    } catch (error) {
+      console.error("[GOL] Error in getNextLifeGeneration:", error);
+      socket.emit("lifeBoardError", {
+        message: "Server error calculating next generation.",
+      });
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Client disconnected from /life namespace:", socket.id);
+  });
+});
+// --- END NEW GOL NAMESPACE ---
+
+// --- Pattern Hunter Specific Socket.IO Functions ---
+async function ensureMainPatternLoadedForTest(socket) {
+  // This is for Pattern Hunter
+  if (!selectedPatternFile) {
+    const errorMsg =
+      "Cannot start search: No pattern file was selected at server startup.";
+    console.error(errorMsg);
+    socket.emit("searchError", errorMsg);
+    return false;
+  }
+  if (!mainThreadPatternMatcher.patternMatrix) {
+    console.log(
+      `[Socket StartSearch] Main thread pattern '${selectedPatternFile}' not loaded, attempting for self-test...`
+    );
+    const mainPatternLoaded = await mainThreadPatternMatcher.loadPattern(
+      selectedPatternFile
+    );
+    if (!mainPatternLoaded) {
+      const errorMsg = `Main thread failed to load pattern '${selectedPatternFile}' for self-test. Cannot start search.`;
+      console.error(errorMsg);
+      socket.emit("searchError", errorMsg);
+      return false;
+    }
+  }
+  return true;
+}
+
+function initializeSearchStateForStart() {
+  // This is for Pattern Hunter
+  isSearching = true;
+  testRunCompleted = !RUN_MATCHER_TEST_ONCE;
+  searchedCount = 0;
+  workersSuccessfullyInitialized = 0;
+  idleWorkers.length = 0;
+  taskQueue.length = 0;
+}
+
+async function resetAndInitializeWorkerPool() {
+  // This is for Pattern Hunter
+  console.log(
+    `Pattern Hunter: Starting search... Terminating any existing workers.`
+  );
+  while (workerPool.length > 0) {
+    const oldWorker = workerPool.pop();
+    if (oldWorker) {
+      await oldWorker
+        .terminate()
+        .catch((e) =>
+          console.error(`Error terminating old Pattern Hunter worker: ${e}`)
+        );
+    }
+  }
+
+  console.log(`Pattern Hunter: Creating up to ${desiredWorkers} new workers.`);
+  if (!selectedPatternFile) {
+    console.error(
+      "Pattern Hunter: Cannot initialize worker pool: No pattern selected."
+    );
+    return;
+  }
+  for (let i = 0; i < desiredWorkers; i++) {
+    createAndAddWorker();
+  }
+}
+
+function startStatusUpdater() {
+  // This is for Pattern Hunter
+  if (statusUpdateInterval) clearInterval(statusUpdateInterval);
+  statusUpdateInterval = setInterval(() => {
+    if (isSearching) {
+      // Only emit if Pattern Hunter is actively searching
+      io.emit("searchStatus", {
+        // Emits to global namespace
+        searchedCount,
+        isSearching,
+        foundCount: foundMatches.length,
+      });
+    }
+  }, STATUS_UPDATE_INTERVAL_MS);
+}
+
+function stopStatusUpdater() {
+  // This is for Pattern Hunter
+  if (statusUpdateInterval) {
+    clearInterval(statusUpdateInterval);
+    statusUpdateInterval = null;
+  }
+}
+
+function shutdownActiveWorkers() {
+  // This is for Pattern Hunter
+  console.log("Pattern Hunter: Signaling workers to shut down...");
+  [...workerPool].forEach((worker) => {
+    if (worker && typeof worker.postMessage === "function") {
+      worker.postMessage({ type: "shutdown" });
+    }
+  });
+  idleWorkers.length = 0;
+}
 
 // --- Application Startup ---
 async function selectPatternFile() {
@@ -526,20 +657,15 @@ async function selectPatternFile() {
       );
       return null;
     }
-
-    // Determine the correct way to call prompt
     const promptFn =
       inquirer.prompt || (inquirer.default && inquirer.default.prompt);
-
     if (typeof promptFn !== "function") {
       console.error(
         "Failed to find the inquirer.prompt function. Please check your inquirer version and import statement."
       );
       throw new TypeError("inquirer.prompt is not a function or accessible");
     }
-
     const answers = await promptFn([
-      // <--- Use promptFn
       {
         type: "list",
         name: "pattern",
@@ -555,14 +681,14 @@ async function selectPatternFile() {
 }
 
 async function main() {
-  // --- NEW: Select pattern file at startup ---
   selectedPatternFile = await selectPatternFile();
   if (!selectedPatternFile) {
-    console.error("No pattern file selected or an error occurred. Exiting.");
-    process.exit(1); // Exit if no pattern is chosen
+    console.error(
+      "No pattern file selected for Pattern Hunter or an error occurred. Exiting."
+    );
+    process.exit(1);
   }
-  console.log(`Using pattern file: ${selectedPatternFile}`);
-  // --- End NEW ---
+  console.log(`Pattern Hunter will use pattern file: ${selectedPatternFile}`);
 
   try {
     await fs.rm(UPLOADS_DIR, { recursive: true, force: true });
@@ -574,27 +700,27 @@ async function main() {
   }
   await qrCodeService.ensureUploadsDirExists();
 
-  // Load pattern for main thread (used for self-test and displaying pattern info)
   const initialPatternLoaded = await mainThreadPatternMatcher.loadPattern(
-    selectedPatternFile // <--- MODIFIED: Use selected pattern
+    selectedPatternFile
   );
   if (initialPatternLoaded) {
     console.log(
-      `[Startup] Initial pattern '${selectedPatternFile}' loaded for self-test/info.`
+      `[Startup] Initial pattern '${selectedPatternFile}' loaded for Pattern Hunter self-test/info.`
     );
   } else {
-    // This is more critical now if the selected file fails to load
     console.error(
-      `[Startup] CRITICAL: Selected pattern '${selectedPatternFile}' could not be loaded. Exiting.`
+      `[Startup] CRITICAL: Selected pattern '${selectedPatternFile}' for Pattern Hunter could not be loaded. Exiting.`
     );
-    process.exit(1); // Exit if the chosen pattern can't be loaded
+    process.exit(1);
   }
 
   server.listen(config.port, () => {
-    console.log(`QR Pattern Finder running at http://localhost:${config.port}`);
+    console.log(`Server running. Access applications:`);
+    console.log(`  Pattern Hunter: http://localhost:${config.port}/`);
+    console.log(`  Game of Life:   http://localhost:${config.port}/life`);
     if (RUN_MATCHER_TEST_ONCE) {
       console.log(
-        `Matcher self-test (RUN_MATCHER_TEST_ONCE) is ENABLED for the first search after 'Start Searching' using pattern '${selectedPatternFile}'.`
+        `Pattern Hunter: Self-test (RUN_MATCHER_TEST_ONCE) is ENABLED for the first search using pattern '${selectedPatternFile}'.`
       );
     }
   });
